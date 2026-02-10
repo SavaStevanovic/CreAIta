@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CreAIta – Stream Viewer</title>
+
+  <!-- HLS.js for browser-side HLS playback -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7"></script>
+
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #242836;
+      --accent: #6c63ff;
+      --accent-hover: #5a52e0;
+      --danger: #e74c3c;
+      --danger-hover: #c0392b;
+      --text: #e4e4e7;
+      --text-muted: #9ca3af;
+      --border: #2d3141;
+      --radius: 10px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── Header ─────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1rem 2rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--accent), #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    header .stream-count {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    /* ── Add-stream form ────────────────────────── */
+    .add-form {
+      display: flex;
+      gap: 0.6rem;
+      padding: 1rem 2rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    .add-form input {
+      flex: 1;
+      min-width: 180px;
+      padding: 0.55rem 0.85rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface2);
+      color: var(--text);
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .add-form input:focus { border-color: var(--accent); }
+    .add-form input::placeholder { color: var(--text-muted); }
+
+    .btn {
+      padding: 0.55rem 1.2rem;
+      border: none;
+      border-radius: var(--radius);
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover { background: var(--danger-hover); }
+    .btn-sm { padding: 0.35rem 0.8rem; font-size: 0.8rem; }
+
+    /* ── Stream grid ────────────────────────────── */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(520px, 1fr));
+      gap: 1.2rem;
+      padding: 1.5rem 2rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .card video {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+    }
+
+    .card-body {
+      padding: 0.75rem 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+    }
+    .card-body .info { flex: 1; min-width: 0; }
+    .card-body .name {
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .card-body .meta {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .status-dot {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+    .status-running    { background: #22c55e; }
+    .status-starting   { background: #f59e0b; }
+    .status-downloading{ background: #3b82f6; animation: pulse 1.2s infinite; }
+    .status-restarting { background: #f59e0b; animation: pulse 1.5s infinite; }
+    .status-error      { background: var(--danger); }
+    .status-stopped    { background: var(--text-muted); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .empty {
+      text-align: center;
+      padding: 4rem 2rem;
+      color: var(--text-muted);
+      font-size: 1.1rem;
+    }
+    .empty p:first-child { font-size: 2.5rem; margin-bottom: 0.5rem; }
+
+    /* ── Notification toast ─────────────────────── */
+    .toast {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.75rem 1.2rem;
+      font-size: 0.88rem;
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all 0.3s;
+      pointer-events: none;
+      z-index: 100;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ CreAIta Stream Viewer</h1>
+  <span class="stream-count" id="streamCount">0 streams</span>
+</header>
+
+<form class="add-form" id="addForm">
+  <input type="text" id="inputName" placeholder="Stream name" required />
+  <input type="url"  id="inputUrl"  placeholder="Stream URL (rtsp://, rtmp://, http://…)" required />
+  <button type="submit" class="btn btn-primary">▶ Add Stream</button>
+</form>
+
+<div class="grid" id="grid"></div>
+<div class="empty" id="empty" style="display:none">
+  <p>📡</p>
+  <p>No streams yet — add one above!</p>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────
+const players = {};   // stream_id → Hls instance
+let pollTimer = null;
+
+// ─── DOM refs ─────────────────────────────────────────────────────
+const grid      = document.getElementById('grid');
+const empty     = document.getElementById('empty');
+const addForm   = document.getElementById('addForm');
+const inputName = document.getElementById('inputName');
+const inputUrl  = document.getElementById('inputUrl');
+const countEl   = document.getElementById('streamCount');
+const toastEl   = document.getElementById('toast');
+
+// ─── Toast helper ─────────────────────────────────────────────────
+function toast(msg, duration = 3000) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  setTimeout(() => toastEl.classList.remove('show'), duration);
+}
+
+// ─── API helpers ──────────────────────────────────────────────────
+async function fetchStreams() {
+  const res = await fetch('/api/streams');
+  return res.json();
+}
+
+async function addStream(name, sourceUrl) {
+  const res = await fetch('/api/streams', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, source_url: sourceUrl }),
+  });
+  return res.json();
+}
+
+async function removeStream(id) {
+  await fetch(`/api/streams/${id}`, { method: 'DELETE' });
+}
+
+// ─── HLS player setup ────────────────────────────────────────────
+function attachHls(videoEl, playlistUrl, streamId) {
+  // Destroy previous player for this stream if exists
+  if (players[streamId]) {
+    players[streamId].destroy();
+    delete players[streamId];
+  }
+
+  if (Hls.isSupported()) {
+    const hls = new Hls({
+      liveSyncDurationCount: 3,
+      liveMaxLatencyDurationCount: 6,
+      enableWorker: true,
+      lowLatencyMode: true,
+    });
+    hls.loadSource(playlistUrl);
+    hls.attachMedia(videoEl);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      videoEl.play().catch(() => {});
+    });
+    hls.on(Hls.Events.ERROR, (_, data) => {
+      if (data.fatal) {
+        // Auto-retry after short delay
+        setTimeout(() => {
+          hls.loadSource(playlistUrl);
+          hls.attachMedia(videoEl);
+        }, 3000);
+      }
+    });
+    players[streamId] = hls;
+  } else if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari native HLS
+    videoEl.src = playlistUrl;
+    videoEl.addEventListener('loadedmetadata', () => videoEl.play());
+  }
+}
+
+// ─── Render ───────────────────────────────────────────────────────
+function renderStreams(streams) {
+  countEl.textContent = `${streams.length} stream${streams.length !== 1 ? 's' : ''}`;
+  empty.style.display = streams.length === 0 ? '' : 'none';
+
+  // Track which stream IDs we've seen
+  const currentIds = new Set(streams.map(s => s.id));
+
+  // Remove cards for streams that no longer exist
+  for (const card of [...grid.children]) {
+    if (!currentIds.has(card.dataset.id)) {
+      if (players[card.dataset.id]) {
+        players[card.dataset.id].destroy();
+        delete players[card.dataset.id];
+      }
+      card.remove();
+    }
+  }
+
+  for (const s of streams) {
+    let card = grid.querySelector(`[data-id="${s.id}"]`);
+    if (!card) {
+      // Create new card
+      card = document.createElement('div');
+      card.className = 'card';
+      card.dataset.id = s.id;
+      card.innerHTML = `
+        <video muted autoplay playsinline></video>
+        <div class="card-body">
+          <div class="info">
+            <div class="name"><span class="status-dot status-${s.status}"></span>${esc(s.name)}</div>
+            <div class="meta" title="${esc(s.source_url)}">${esc(s.source_url)}</div>
+          </div>
+          <button class="btn btn-danger btn-sm" onclick="handleRemove('${s.id}')">✕ Remove</button>
+        </div>
+      `;
+      grid.appendChild(card);
+
+      // Attach HLS player if stream is running
+      if (s.status === 'running') {
+        const video = card.querySelector('video');
+        // Small delay to let FFmpeg produce the first segments
+        setTimeout(() => attachHls(video, s.playlist_url, s.id), 2000);
+      }
+    } else {
+      // Update status dot
+      const dot = card.querySelector('.status-dot');
+      dot.className = `status-dot status-${s.status}`;
+
+      // If stream just became "running" and player not yet attached, attach it
+      if (s.status === 'running' && !players[s.id]) {
+        const video = card.querySelector('video');
+        attachHls(video, s.playlist_url, s.id);
+      }
+    }
+  }
+}
+
+function esc(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+// ─── Event handlers ───────────────────────────────────────────────
+addForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = inputName.value.trim();
+  const url  = inputUrl.value.trim();
+  if (!name || !url) return;
+
+  try {
+    await addStream(name, url);
+    inputName.value = '';
+    inputUrl.value = '';
+    toast(`Stream "${name}" added`);
+    refresh();
+  } catch (err) {
+    toast(`Error: ${err.message}`);
+  }
+});
+
+async function handleRemove(id) {
+  try {
+    await removeStream(id);
+    toast('Stream removed');
+    refresh();
+  } catch (err) {
+    toast(`Error: ${err.message}`);
+  }
+}
+
+async function refresh() {
+  try {
+    const streams = await fetchStreams();
+    renderStreams(streams);
+  } catch (err) {
+    console.error('Refresh error:', err);
+  }
+}
+
+// ─── Polling (keeps UI in sync, reconnects after refresh) ─────────
+function startPolling(intervalMs = 4000) {
+  refresh();  // immediate first load
+  pollTimer = setInterval(refresh, intervalMs);
+}
+
+startPolling();
+</script>
+</body>
+</html>
