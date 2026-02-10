@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "creaita"
+version = "0.1.0"
+description = "AI-powered stream viewer with HLS transcoding"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{include = "app"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.110.0"
+uvicorn = {extras = ["standard"], version = "^0.29.0"}
+
+[tool.poetry.group.dev.dependencies]
+# Add development dependencies here
+
+[tool.poetry.group.ml]
+optional = true
+
+[tool.poetry.group.ml.dependencies]
+# Future DL integration
+# opencv-python-headless = "^4.9.0"
+# numpy = "^1.26.0"
+# torch = "^2.2.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+creaita = "app.main:run"

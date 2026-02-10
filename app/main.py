@@ -44,8 +44,8 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # ── API models ──────────────────────────────────────────────────────
 class AddStreamRequest(BaseModel):
-    name: str
     source_url: str
+    name: str | None = None  # Optional - will be derived from stream if not provided
 
 
 class StreamResponse(BaseModel):
@@ -70,7 +70,7 @@ async def list_streams() -> list[dict]:
 
 @app.post("/api/streams", status_code=201)
 async def add_stream(req: AddStreamRequest) -> dict:
-    info = manager.add_stream(name=req.name, source_url=req.source_url)
+    info = await manager.add_stream_async(source_url=req.source_url, name=req.name)
     managed = manager.get_stream(info.id)
     return {
         "id": info.id,

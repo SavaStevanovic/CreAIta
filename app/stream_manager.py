@@ -16,6 +16,7 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -29,6 +30,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+
+from .stream_handlers import StreamHandlerRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +144,7 @@ class ManagedStream:
         self._stderr_path: Optional[Path] = None
         self._stderr_fh = None
         self._video_path: Optional[Path] = None  # cached VOD download
+        self._handler = None  # StreamHandler instance, set by background task
         self.hls_dir = STREAMS_DIR / info.id
         self.hls_dir.mkdir(parents=True, exist_ok=True)
 
@@ -226,18 +230,17 @@ class ManagedStream:
                 ).start()
 
     def _start_piped(self, gen: int) -> None:
-        """Start feeder (streamlink/yt-dlp) piped into FFmpeg."""
-        url = self.info.source_url
+        """Start feeder (streamlink/yt-dlp) piped into FFmpeg using handler."""
+        if not self._handler:
+            # Fallback to old logic if handler not set (e.g., restored from state)
+            from .stream_handlers import StreamHandlerRegistry
+            registry = StreamHandlerRegistry()
+            self._handler = registry.get_handler(self.info.source_url)
+            if not self._handler:
+                raise RuntimeError("No handler found for URL")
 
-        if _YOUTUBE_RE.search(url):
-            feeder_cmd = [
-                "yt-dlp", "-f", "best",
-                "--throttled-rate", "100K",  # reconnect if YouTube throttles
-                "-o", "-", url,
-            ]
-        else:
-            feeder_cmd = ["streamlink", "--stdout", url, "best"]
-
+        feeder_cmd = self._handler.get_feeder_command(self.info.source_url)
+        
         logger.info("Starting feeder for stream %s (gen %d): %s",
                     self.info.id, gen, " ".join(feeder_cmd[:4]))
 
@@ -247,7 +250,7 @@ class ManagedStream:
             stderr=subprocess.DEVNULL,
         )
 
-        ffmpeg_cmd = self._build_ffmpeg_cmd_piped()
+        ffmpeg_cmd = self._build_ffmpeg_cmd_generic(["-i", "pipe:0"])
         logger.info("Starting FFmpeg (piped) for stream %s (gen %d)", self.info.id, gen)
 
         self._stderr_path = self.hls_dir / "ffmpeg_stderr.log"
@@ -264,8 +267,18 @@ class ManagedStream:
 
     def _start_direct(self, gen: int) -> None:
         """Start FFmpeg directly with the URL (non-platform streams)."""
-        resolved_url = resolve_stream_url(self.info.source_url)
-        cmd = self._build_ffmpeg_cmd_direct(resolved_url)
+        if not self._handler:
+            # Fallback to old logic if handler not set (e.g., restored from state)
+            from .stream_handlers import StreamHandlerRegistry
+            registry = StreamHandlerRegistry()
+            self._handler = registry.get_handler(self.info.source_url)
+            if not self._handler:
+                raise RuntimeError("No handler found for URL")
+        
+        # Get input args from handler
+        input_args = self._handler.get_ffmpeg_input_args(self.info.source_url)
+        cmd = self._build_ffmpeg_cmd_generic(input_args)
+        
         logger.info("Starting FFmpeg (direct) for stream %s (gen %d)", self.info.id, gen)
 
         self._stderr_path = self.hls_dir / "ffmpeg_stderr.log"
@@ -364,12 +377,16 @@ class ManagedStream:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _build_ffmpeg_cmd_piped(self) -> list[str]:
-        """FFmpeg command when reading from stdin pipe."""
+    def _build_ffmpeg_cmd_generic(self, input_args: list[str]) -> list[str]:
+        """
+        FFmpeg command when reading from generic input (URL, pipe, etc.).
+        input_args should be complete list like ["-i", "pipe:0"] or ["-reconnect", "1", "-i", "url"].
+        """
         out = str(self.hls_dir / "stream.m3u8")
+
         return [
             "ffmpeg",
-            "-i", "pipe:0",
+            *input_args,
             # Video
             "-c:v", "libx264",
             "-preset", "ultrafast",
@@ -390,7 +407,7 @@ class ManagedStream:
         ]
 
     def _build_ffmpeg_cmd_direct(self, resolved_url: str) -> list[str]:
-        """FFmpeg command when reading a URL directly."""
+        """FFmpeg command when reading a URL directly. (Legacy fallback)"""
         out = str(self.hls_dir / "stream.m3u8")
 
         input_flags: list[str] = []
@@ -659,11 +676,109 @@ class StreamManager:
         STREAMS_DIR.mkdir(parents=True, exist_ok=True)
         self._streams: dict[str, ManagedStream] = {}
         self._lock = threading.Lock()
+        self._handler_registry = StreamHandlerRegistry()
         self._restore_state()
 
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
+    async def add_stream_async(self, source_url: str, name: str | None = None) -> StreamInfo:
+        """
+        Add a stream asynchronously. Returns immediately with 'initializing' status,
+        then spawns background task to extract metadata and start the stream.
+        This prevents blocking the API endpoint during metadata extraction or VOD downloads.
+        """
+        stream_id = uuid.uuid4().hex[:12]
+        
+        # Create stream with initializing status and placeholder name
+        display_name = name if name else f"Stream {stream_id[:6]}"
+        
+        info = StreamInfo(
+            id=stream_id,
+            name=display_name,
+            source_url=source_url,
+            status="initializing",
+            is_platform_url=False,  # Will be updated by background task
+            is_vod=False,  # Will be updated by background task
+        )
+        
+        managed = ManagedStream(info)
+        with self._lock:
+            self._streams[stream_id] = managed
+        self._save_state()
+        
+        # Start background task for metadata extraction and stream initialization
+        asyncio.create_task(self._initialize_stream_background(managed, name))
+        
+        return info
+
+    async def _initialize_stream_background(self, managed: ManagedStream, user_name: str | None) -> None:
+        """
+        Background task that extracts metadata, derives name if needed, and starts the stream.
+        Runs in a thread pool to avoid blocking asyncio event loop with subprocess calls.
+        """
+        loop = asyncio.get_event_loop()
+        
+        try:
+            # Run metadata extraction in thread pool (since it uses subprocess)
+            handler = await loop.run_in_executor(
+                None, self._handler_registry.get_handler, managed.info.source_url
+            )
+            
+            if handler is None:
+                managed.info.status = "error"
+                managed.info.error_message = "No handler found for this stream URL"
+                self._save_state()
+                return
+            
+            # Extract metadata (title, duration, is_live, is_vod)
+            metadata = await loop.run_in_executor(
+                None, handler.get_metadata, managed.info.source_url
+            )
+            
+            # Derive name from metadata if user didn't provide one
+            if user_name:
+                final_name = user_name
+            elif metadata and metadata.title:
+                final_name = metadata.title
+            else:
+                # Fallback: extract from URL
+                final_name = self._derive_name_from_url(managed.info.source_url)
+            
+            # Update stream info with metadata
+            managed.info.name = final_name
+            managed.info.is_platform_url = handler.__class__.__name__ in ("TwitchHandler", "YouTubeHandler")
+            
+            if metadata:
+                managed.info.is_vod = metadata.is_vod
+            
+            # Store handler reference for use during start()
+            managed._handler = handler
+            
+            self._save_state()
+            
+            # Now start the stream (this may download VOD, etc.)
+            await loop.run_in_executor(None, managed.start)
+            
+        except Exception as e:
+            logger.exception("Failed to initialize stream %s", managed.info.id)
+            managed.info.status = "error"
+            managed.info.error_message = str(e)
+            self._save_state()
+
+    def _derive_name_from_url(self, url: str) -> str:
+        """Extract a reasonable name from a URL if no title metadata is available."""
+        # Remove protocol
+        name = re.sub(r'^https?://', '', url)
+        # Remove query params
+        name = name.split('?')[0]
+        # Take last part of path or domain
+        parts = name.rstrip('/').split('/')
+        name = parts[-1] if len(parts) > 1 else parts[0]
+        # Clean up
+        name = name.replace('_', ' ').replace('-', ' ').strip()
+        return name[:50] or "Unnamed Stream"
+
     def add_stream(self, name: str, source_url: str) -> StreamInfo:
         stream_id = uuid.uuid4().hex[:12]
 

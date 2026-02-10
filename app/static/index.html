@@ -143,12 +143,13 @@
       margin-right: 4px;
       vertical-align: middle;
     }
-    .status-running    { background: #22c55e; }
-    .status-starting   { background: #f59e0b; }
-    .status-downloading{ background: #3b82f6; animation: pulse 1.2s infinite; }
-    .status-restarting { background: #f59e0b; animation: pulse 1.5s infinite; }
-    .status-error      { background: var(--danger); }
-    .status-stopped    { background: var(--text-muted); }
+    .status-running     { background: #22c55e; }
+    .status-starting    { background: #f59e0b; }
+    .status-initializing{ background: #a78bfa; animation: pulse 1.2s infinite; }
+    .status-downloading { background: #3b82f6; animation: pulse 1.2s infinite; }
+    .status-restarting  { background: #f59e0b; animation: pulse 1.5s infinite; }
+    .status-error       { background: var(--danger); }
+    .status-stopped     { background: var(--text-muted); }
 
     @keyframes pulse {
       0%, 100% { opacity: 1; }
@@ -190,7 +191,7 @@
 </header>
 
 <form class="add-form" id="addForm">
-  <input type="text" id="inputName" placeholder="Stream name" required />
+  <input type="text" id="inputName" placeholder="Stream name (optional - auto-detected)" />
   <input type="url"  id="inputUrl"  placeholder="Stream URL (rtsp://, rtmp://, http://…)" required />
   <button type="submit" class="btn btn-primary">▶ Add Stream</button>
 </form>
@@ -349,13 +350,13 @@ addForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const name = inputName.value.trim();
   const url  = inputUrl.value.trim();
-  if (!name || !url) return;
+  if (!url) return;
 
   try {
-    await addStream(name, url);
+    await addStream(name || null, url);
     inputName.value = '';
     inputUrl.value = '';
-    toast(`Stream "${name}" added`);
+    toast(name ? `Stream "${name}" added` : 'Stream added');
     refresh();
   } catch (err) {
     toast(`Error: ${err.message}`);
