@@ -406,41 +406,6 @@ class ManagedStream:
             out,
         ]
 
-    def _build_ffmpeg_cmd_direct(self, resolved_url: str) -> list[str]:
-        """FFmpeg command when reading a URL directly. (Legacy fallback)"""
-        out = str(self.hls_dir / "stream.m3u8")
-
-        input_flags: list[str] = []
-        if resolved_url.startswith("http"):
-            input_flags += ["-reconnect", "1", "-reconnect_delay_max", "5"]
-            if ".m3u8" in resolved_url or "playlist" in resolved_url:
-                input_flags += ["-reconnect_streamed", "1"]
-            if "googlevideo.com" in resolved_url:
-                input_flags += ["-user_agent", _BROWSER_UA]
-
-        return [
-            "ffmpeg",
-            *input_flags,
-            "-i", resolved_url,
-            # Video
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-g", "30",
-            "-sc_threshold", "0",
-            # Audio
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ac", "2",
-            # HLS settings
-            "-f", "hls",
-            "-hls_time", "2",
-            "-hls_list_size", "10",
-            "-hls_flags", "delete_segments+append_list",
-            "-hls_segment_filename", str(self.hls_dir / "seg_%03d.ts"),
-            out,
-        ]
-
     def _build_ffmpeg_cmd_vod(self, video_path: str) -> list[str]:
         """FFmpeg command for looping a local VOD file at real-time speed."""
         out = str(self.hls_dir / "stream.m3u8")
