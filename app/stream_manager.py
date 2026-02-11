@@ -17,9 +17,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import re
 import shutil
 import signal
@@ -29,8 +27,8 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
 
+from . import database
 from .stream_handlers import StreamHandlerRegistry
 
 logger = logging.getLogger(__name__)
@@ -53,7 +51,9 @@ def _detect_youtube_vod(url: str) -> bool:
     try:
         result = subprocess.run(
             ["yt-dlp", "--print", "is_live", "--no-download", "--no-warnings", url],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         val = result.stdout.strip().lower()
         # is_live: "True" for live, "False"/"None"/"" for VOD
@@ -87,8 +87,12 @@ def resolve_stream_url(url: str) -> str:
                 if resolved.startswith("http"):
                     logger.info("Resolved (yt-dlp) %s → %s", url, resolved[:120])
                     return resolved
-            logger.warning("yt-dlp failed (rc=%d) for %s: %s",
-                           result.returncode, url, result.stderr.strip()[:200])
+            logger.warning(
+                "yt-dlp failed (rc=%d) for %s: %s",
+                result.returncode,
+                url,
+                result.stderr.strip()[:200],
+            )
         except subprocess.TimeoutExpired:
             logger.warning("yt-dlp timed out for %s", url)
         except FileNotFoundError:
@@ -108,8 +112,12 @@ def resolve_stream_url(url: str) -> str:
                 logger.info("Resolved (streamlink) %s → %s", url, resolved[:120])
                 return resolved
         else:
-            logger.warning("streamlink failed (rc=%d) for %s: %s",
-                           result.returncode, url, result.stderr.strip()[:200])
+            logger.warning(
+                "streamlink failed (rc=%d) for %s: %s",
+                result.returncode,
+                url,
+                result.stderr.strip()[:200],
+            )
     except subprocess.TimeoutExpired:
         logger.warning("streamlink timed out for %s", url)
     except FileNotFoundError:
@@ -131,7 +139,7 @@ class StreamInfo:
     status: str = "starting"  # starting | running | stopped | error | restarting
     error_message: str = ""
     is_platform_url: bool = False  # Twitch/YouTube etc. — don't auto-restore
-    is_vod: bool = False           # YouTube VOD — download & loop locally
+    is_vod: bool = False  # YouTube VOD — download & loop locally
 
 
 class ManagedStream:
@@ -139,20 +147,20 @@ class ManagedStream:
 
     def __init__(self, info: StreamInfo):
         self.info = info
-        self.process: Optional[subprocess.Popen] = None
-        self._feeder: Optional[subprocess.Popen] = None  # streamlink / yt-dlp
-        self._stderr_path: Optional[Path] = None
+        self.process: subprocess.Popen | None = None
+        self._feeder: subprocess.Popen | None = None  # streamlink / yt-dlp
+        self._stderr_path: Path | None = None
         self._stderr_fh = None
-        self._video_path: Optional[Path] = None  # cached VOD download
+        self._video_path: Path | None = None  # cached VOD download
         self._handler = None  # StreamHandler instance, set by background task
         self.hls_dir = STREAMS_DIR / info.id
         self.hls_dir.mkdir(parents=True, exist_ok=True)
 
         self._stopping = False
-        self._generation = 0          # bumped on every start(); old threads check this
+        self._generation = 0  # bumped on every start(); old threads check this
         self._restart_count = 0
         self._restart_lock = threading.Lock()
-        self._start_time = 0.0        # when current FFmpeg was spawned
+        self._start_time = 0.0  # when current FFmpeg was spawned
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -217,16 +225,22 @@ class ManagedStream:
 
         # ---- Background threads ----
         threading.Thread(
-            target=self._monitor, args=(gen,), daemon=True,
+            target=self._monitor,
+            args=(gen,),
+            daemon=True,
         ).start()
 
         if self.info.is_platform_url or self.info.is_vod:
             threading.Thread(
-                target=self._health_check, args=(gen,), daemon=True,
+                target=self._health_check,
+                args=(gen,),
+                daemon=True,
             ).start()
             if not self.info.is_vod:
                 threading.Thread(
-                    target=self._periodic_token_refresh, args=(gen,), daemon=True,
+                    target=self._periodic_token_refresh,
+                    args=(gen,),
+                    daemon=True,
                 ).start()
 
     def _start_piped(self, gen: int) -> None:
@@ -234,15 +248,20 @@ class ManagedStream:
         if not self._handler:
             # Fallback to old logic if handler not set (e.g., restored from state)
             from .stream_handlers import StreamHandlerRegistry
+
             registry = StreamHandlerRegistry()
             self._handler = registry.get_handler(self.info.source_url)
             if not self._handler:
                 raise RuntimeError("No handler found for URL")
 
         feeder_cmd = self._handler.get_feeder_command(self.info.source_url)
-        
-        logger.info("Starting feeder for stream %s (gen %d): %s",
-                    self.info.id, gen, " ".join(feeder_cmd[:4]))
+
+        logger.info(
+            "Starting feeder for stream %s (gen %d): %s",
+            self.info.id,
+            gen,
+            " ".join(feeder_cmd[:4]),
+        )
 
         self._feeder = subprocess.Popen(
             feeder_cmd,
@@ -270,15 +289,17 @@ class ManagedStream:
         if not self._handler:
             # Fallback to old logic if handler not set (e.g., restored from state)
             from .stream_handlers import StreamHandlerRegistry
+
             registry = StreamHandlerRegistry()
             self._handler = registry.get_handler(self.info.source_url)
             if not self._handler:
                 raise RuntimeError("No handler found for URL")
-        
-        # Get input args from handler
-        input_args = self._handler.get_ffmpeg_input_args(self.info.source_url)
+
+        # Get input args from handler (returns tuple of (flags, input_source))
+        input_flags, input_source = self._handler.get_ffmpeg_input_args(self.info.source_url)
+        input_args = [*input_flags, "-i", input_source]
         cmd = self._build_ffmpeg_cmd_generic(input_args)
-        
+
         logger.info("Starting FFmpeg (direct) for stream %s (gen %d)", self.info.id, gen)
 
         self._stderr_path = self.hls_dir / "ffmpeg_stderr.log"
@@ -295,41 +316,48 @@ class ManagedStream:
 
         # Re-use an earlier download if present
         existing = [
-            f for f in self.hls_dir.glob("source_video.*")
+            f
+            for f in self.hls_dir.glob("source_video.*")
             if f.suffix not in (".ts", ".m3u8", ".log", ".part")
         ]
         if existing:
             video_path = existing[0]
-            logger.info("Reusing cached video %s for stream %s",
-                        video_path.name, self.info.id)
+            logger.info("Reusing cached video %s for stream %s", video_path.name, self.info.id)
         else:
             self.info.status = "downloading"
-            logger.info("Downloading video for stream %s (gen %d)…",
-                        self.info.id, gen)
+            logger.info("Downloading video for stream %s (gen %d)…", self.info.id, gen)
             result = subprocess.run(
-                ["yt-dlp", "-f", "best", "--no-warnings",
-                 "-o", str(self.hls_dir / "source_video.%(ext)s"), url],
-                capture_output=True, text=True, timeout=600,
+                [
+                    "yt-dlp",
+                    "-f",
+                    "best",
+                    "--no-warnings",
+                    "-o",
+                    str(self.hls_dir / "source_video.%(ext)s"),
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
             )
             if result.returncode != 0:
-                raise RuntimeError(
-                    f"yt-dlp download failed: {result.stderr.strip()[:300]}")
+                raise RuntimeError(f"yt-dlp download failed: {result.stderr.strip()[:300]}")
             existing = [
-                f for f in self.hls_dir.glob("source_video.*")
+                f
+                for f in self.hls_dir.glob("source_video.*")
                 if f.suffix not in (".ts", ".m3u8", ".log", ".part")
             ]
             if not existing:
                 raise RuntimeError("yt-dlp produced no output file")
             video_path = existing[0]
-            logger.info("Downloaded %s (%.1f MB)",
-                        video_path.name,
-                        video_path.stat().st_size / 1_048_576)
+            logger.info(
+                "Downloaded %s (%.1f MB)", video_path.name, video_path.stat().st_size / 1_048_576
+            )
 
         self._video_path = video_path
 
         ffmpeg_cmd = self._build_ffmpeg_cmd_vod(str(video_path))
-        logger.info("Starting FFmpeg (VOD loop) for stream %s (gen %d)",
-                    self.info.id, gen)
+        logger.info("Starting FFmpeg (VOD loop) for stream %s (gen %d)", self.info.id, gen)
 
         self._stderr_path = self.hls_dir / "ffmpeg_stderr.log"
         self._stderr_fh = open(self._stderr_path, "w")
@@ -388,21 +416,34 @@ class ManagedStream:
             "ffmpeg",
             *input_args,
             # Video
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-g", "30",
-            "-sc_threshold", "0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-g",
+            "30",
+            "-sc_threshold",
+            "0",
             # Audio
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ac", "2",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ac",
+            "2",
             # HLS settings
-            "-f", "hls",
-            "-hls_time", "2",
-            "-hls_list_size", "10",
-            "-hls_flags", "delete_segments+append_list",
-            "-hls_segment_filename", str(self.hls_dir / "seg_%03d.ts"),
+            "-f",
+            "hls",
+            "-hls_time",
+            "2",
+            "-hls_list_size",
+            "10",
+            "-hls_flags",
+            "delete_segments+append_list",
+            "-hls_segment_filename",
+            str(self.hls_dir / "seg_%03d.ts"),
             out,
         ]
 
@@ -411,25 +452,40 @@ class ManagedStream:
         out = str(self.hls_dir / "stream.m3u8")
         return [
             "ffmpeg",
-            "-re",                     # read at native frame rate
-            "-stream_loop", "-1",      # loop forever
-            "-i", video_path,
+            "-re",  # read at native frame rate
+            "-stream_loop",
+            "-1",  # loop forever
+            "-i",
+            video_path,
             # Video
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-g", "30",
-            "-sc_threshold", "0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-g",
+            "30",
+            "-sc_threshold",
+            "0",
             # Audio
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ac", "2",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ac",
+            "2",
             # HLS settings — standard live window
-            "-f", "hls",
-            "-hls_time", "4",
-            "-hls_list_size", "10",
-            "-hls_flags", "delete_segments+append_list",
-            "-hls_segment_filename", str(self.hls_dir / "seg_%06d.ts"),
+            "-f",
+            "hls",
+            "-hls_time",
+            "4",
+            "-hls_list_size",
+            "10",
+            "-hls_flags",
+            "delete_segments+append_list",
+            "-hls_segment_filename",
+            str(self.hls_dir / "seg_%06d.ts"),
             out,
         ]
 
@@ -475,7 +531,10 @@ class ManagedStream:
 
         logger.warning(
             "Stream %s FFmpeg exited code %d (gen %d). stderr: %s",
-            self.info.id, ret, gen, stderr_tail.replace("\n", " ")[:300],
+            self.info.id,
+            ret,
+            gen,
+            stderr_tail.replace("\n", " ")[:300],
         )
 
         # Auto-restart platform streams
@@ -488,7 +547,7 @@ class ManagedStream:
     # ---------- health-check thread ----------
     def _health_check(self, gen: int) -> None:
         """Kill FFmpeg if it stops producing segments (token expired, network lost)."""
-        INITIAL_GRACE = 45   # seconds before first check
+        INITIAL_GRACE = 45  # seconds before first check
         CHECK_INTERVAL = 15  # seconds between checks
         STUCK_THRESHOLD = 90  # seconds with no new .ts → consider stuck
 
@@ -514,7 +573,9 @@ class ManagedStream:
                 if age > STUCK_THRESHOLD:
                     logger.warning(
                         "Stream %s stuck — no new segments for %.0fs (gen %d), killing FFmpeg",
-                        self.info.id, age, gen,
+                        self.info.id,
+                        age,
+                        gen,
                     )
                     feeder = self._feeder
                     if feeder:
@@ -532,7 +593,9 @@ class ManagedStream:
                 if time.time() - self._start_time > INITIAL_GRACE + 30:
                     logger.warning(
                         "Stream %s produced no segments after %.0fs (gen %d), killing FFmpeg",
-                        self.info.id, time.time() - self._start_time, gen,
+                        self.info.id,
+                        time.time() - self._start_time,
+                        gen,
                     )
                     feeder = self._feeder
                     if feeder:
@@ -599,7 +662,10 @@ class ManagedStream:
         delay = min(3 * (2 ** (attempt - 1)), 30)
         logger.info(
             "Stream %s: will restart in %ds (attempt %d, gen %d)",
-            self.info.id, delay, attempt, gen,
+            self.info.id,
+            delay,
+            attempt,
+            gen,
         )
 
         for _ in range(delay):
@@ -615,7 +681,9 @@ class ManagedStream:
 
         # If start succeeded and first segments appear, reset counter after a while
         threading.Thread(
-            target=self._confirm_recovery, args=(self._generation,), daemon=True,
+            target=self._confirm_recovery,
+            args=(self._generation,),
+            daemon=True,
         ).start()
 
     def _confirm_recovery(self, gen: int) -> None:
@@ -629,35 +697,38 @@ class ManagedStream:
         if ts_files and gen == self._generation:
             logger.info(
                 "Stream %s: confirmed recovery after %d attempts — resetting counter",
-                self.info.id, self._restart_count,
+                self.info.id,
+                self._restart_count,
             )
             self._restart_count = 0
 
 
 class StreamManager:
-    """Manages all active streams.  Singleton-ish; one per server."""
+    """Manages all active streams per user."""
 
     def __init__(self) -> None:
         STREAMS_DIR.mkdir(parents=True, exist_ok=True)
-        self._streams: dict[str, ManagedStream] = {}
+        # Key: (user_id, stream_id) -> ManagedStream
+        self._streams: dict[tuple[int, str], ManagedStream] = {}
         self._lock = threading.Lock()
         self._handler_registry = StreamHandlerRegistry()
-        self._restore_state()
 
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
-    async def add_stream_async(self, source_url: str, name: str | None = None) -> StreamInfo:
+    async def add_stream_async(
+        self, user_id: int, source_url: str, name: str | None = None
+    ) -> StreamInfo:
         """
         Add a stream asynchronously. Returns immediately with 'initializing' status,
         then spawns background task to extract metadata and start the stream.
         This prevents blocking the API endpoint during metadata extraction or VOD downloads.
         """
         stream_id = uuid.uuid4().hex[:12]
-        
+
         # Create stream with initializing status and placeholder name
         display_name = name if name else f"Stream {stream_id[:6]}"
-        
+
         info = StreamInfo(
             id=stream_id,
             name=display_name,
@@ -666,41 +737,50 @@ class StreamManager:
             is_platform_url=False,  # Will be updated by background task
             is_vod=False,  # Will be updated by background task
         )
-        
+
         managed = ManagedStream(info)
         with self._lock:
-            self._streams[stream_id] = managed
-        self._save_state()
-        
+            self._streams[(user_id, stream_id)] = managed
+
+        # Save to database
+        database.save_stream(
+            user_id=user_id,
+            stream_id=stream_id,
+            name=display_name,
+            source_url=source_url,
+            status="initializing",
+        )
+
         # Start background task for metadata extraction and stream initialization
-        asyncio.create_task(self._initialize_stream_background(managed, name))
-        
+        asyncio.create_task(self._initialize_stream_background(user_id, managed, name))
+
         return info
 
-    async def _initialize_stream_background(self, managed: ManagedStream, user_name: str | None) -> None:
+    async def _initialize_stream_background(
+        self, user_id: int, managed: ManagedStream, user_name: str | None
+    ) -> None:
         """
         Background task that extracts metadata, derives name if needed, and starts the stream.
         Runs in a thread pool to avoid blocking asyncio event loop with subprocess calls.
         """
         loop = asyncio.get_event_loop()
-        
+
         try:
             # Run metadata extraction in thread pool (since it uses subprocess)
             handler = await loop.run_in_executor(
                 None, self._handler_registry.get_handler, managed.info.source_url
             )
-            
+
             if handler is None:
                 managed.info.status = "error"
                 managed.info.error_message = "No handler found for this stream URL"
-                self._save_state()
                 return
-            
+
             # Extract metadata (title, duration, is_live, is_vod)
             metadata = await loop.run_in_executor(
                 None, handler.get_metadata, managed.info.source_url
             )
-            
+
             # Derive name from metadata if user didn't provide one
             if user_name:
                 final_name = user_name
@@ -709,39 +789,58 @@ class StreamManager:
             else:
                 # Fallback: extract from URL
                 final_name = self._derive_name_from_url(managed.info.source_url)
-            
+
             # Update stream info with metadata
             managed.info.name = final_name
-            managed.info.is_platform_url = handler.__class__.__name__ in ("TwitchHandler", "YouTubeHandler")
-            
+            managed.info.is_platform_url = handler.__class__.__name__ in (
+                "TwitchHandler",
+                "YouTubeHandler",
+            )
+
             if metadata:
                 managed.info.is_vod = metadata.is_vod
-            
+
             # Store handler reference for use during start()
             managed._handler = handler
-            
-            self._save_state()
-            
+
+            # Save updated info to database
+            database.save_stream(
+                user_id=user_id,
+                stream_id=managed.info.id,
+                name=final_name,
+                source_url=managed.info.source_url,
+                status=managed.info.status,
+                is_platform_url=managed.info.is_platform_url,
+                is_vod=managed.info.is_vod,
+            )
+
             # Now start the stream (this may download VOD, etc.)
             await loop.run_in_executor(None, managed.start)
-            
+
         except Exception as e:
             logger.exception("Failed to initialize stream %s", managed.info.id)
             managed.info.status = "error"
             managed.info.error_message = str(e)
-            self._save_state()
+            database.save_stream(
+                user_id=user_id,
+                stream_id=managed.info.id,
+                name=managed.info.name,
+                source_url=managed.info.source_url,
+                status="error",
+                error_message=str(e),
+            )
 
     def _derive_name_from_url(self, url: str) -> str:
         """Extract a reasonable name from a URL if no title metadata is available."""
         # Remove protocol
-        name = re.sub(r'^https?://', '', url)
+        name = re.sub(r"^https?://", "", url)
         # Remove query params
-        name = name.split('?')[0]
+        name = name.split("?")[0]
         # Take last part of path or domain
-        parts = name.rstrip('/').split('/')
+        parts = name.rstrip("/").split("/")
         name = parts[-1] if len(parts) > 1 else parts[0]
         # Clean up
-        name = name.replace('_', ' ').replace('-', ' ').strip()
+        name = name.replace("_", " ").replace("-", " ").strip()
         return name[:50] or "Unnamed Stream"
 
     def add_stream(self, name: str, source_url: str) -> StreamInfo:
@@ -764,67 +863,30 @@ class StreamManager:
         self._save_state()
         return info
 
-    def remove_stream(self, stream_id: str) -> bool:
+    def remove_stream(self, user_id: int, stream_id: str) -> bool:
         with self._lock:
-            managed = self._streams.pop(stream_id, None)
+            managed = self._streams.pop((user_id, stream_id), None)
         if managed is None:
             return False
         managed.cleanup()
-        self._save_state()
+        database.delete_stream(user_id, stream_id)
         return True
 
-    def get_stream(self, stream_id: str) -> Optional[ManagedStream]:
-        return self._streams.get(stream_id)
+    def get_stream(self, user_id: int, stream_id: str) -> ManagedStream | None:
+        return self._streams.get((user_id, stream_id))
 
-    def list_streams(self) -> list[dict]:
+    def list_streams(self, user_id: int) -> list[dict]:
         results = []
-        for m in self._streams.values():
-            d = asdict(m.info)
-            d["playlist_url"] = m.playlist_url
-            results.append(d)
+        with self._lock:
+            for (uid, _), m in self._streams.items():
+                if uid == user_id:
+                    d = asdict(m.info)
+                    d["playlist_url"] = m.playlist_url
+                    results.append(d)
         return results
 
     def stop_all(self) -> None:
-        for m in self._streams.values():
+        with self._lock:
+            streams = list(self._streams.values())
+        for m in streams:
             m.stop()
-        self._save_state()
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-    def _save_state(self) -> None:
-        data = [asdict(m.info) for m in self._streams.values()]
-        try:
-            STATE_FILE.write_text(json.dumps(data, indent=2))
-        except Exception:
-            logger.exception("Failed to save stream state")
-
-    def _restore_state(self) -> None:
-        if not STATE_FILE.exists():
-            return
-        try:
-            data = json.loads(STATE_FILE.read_text())
-        except Exception:
-            logger.exception("Failed to read stream state")
-            return
-        for entry in data:
-            if "is_platform_url" not in entry:
-                entry["is_platform_url"] = False
-            if "is_vod" not in entry:
-                entry["is_vod"] = False
-            info = StreamInfo(**entry)
-
-            if info.is_platform_url and not info.is_vod:
-                logger.info(
-                    "Skipping auto-restore of live platform stream %s (%s) — re-add manually",
-                    info.id, info.name,
-                )
-                continue
-
-            if info.status in ("running", "starting", "restarting", "downloading"):
-                info.status = "starting"
-                managed = ManagedStream(info)
-                self._streams[info.id] = managed
-                managed.start()
-                logger.info("Restored stream %s (%s)", info.id, info.name)
-        self._save_state()

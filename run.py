@@ -2,6 +2,7 @@
 """Entry-point for the CreAIta Stream Viewer server."""
 
 import logging
+
 import uvicorn
 
 logging.basicConfig(

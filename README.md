@@ -1,6 +1,6 @@
 # CreAIta – Stream Viewer
 
-A Python-based live-stream viewer with a web frontend.  
+A Python-based live-stream viewer with a web frontend.
 Feed it any stream URL (RTSP, RTMP, HTTP/HLS, …) and watch it in your browser.
 
 ## Architecture
@@ -32,7 +32,7 @@ any PyTorch / TensorFlow model for real-time inference overlays.
 | FFmpeg     | ≥ 5.0   | Stream transcoding             |
 | streamlink | latest  | Optional: Twitch/YouTube URLs  |
 
-Make sure `ffmpeg` is on your `PATH`.  
+Make sure `ffmpeg` is on your `PATH`.
 For Twitch/YouTube support, install `streamlink`: `sudo apt install streamlink` or `pip install streamlink`.
 
 ## Quick Start

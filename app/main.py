@@ -8,11 +8,12 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import Cookie, FastAPI, HTTPException, Response
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import database
 from .stream_manager import STREAMS_DIR, StreamManager
 
 logger = logging.getLogger(__name__)
@@ -24,8 +25,9 @@ manager: StreamManager | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global manager
+    database.init_db()
     manager = StreamManager()
-    logger.info("StreamManager initialised – %d streams restored", len(manager.list_streams()))
+    logger.info("StreamManager initialised – database ready")
     yield
     logger.info("Shutting down – stopping all streams")
     manager.stop_all()
@@ -58,20 +60,41 @@ class StreamResponse(BaseModel):
 
 
 # ── REST endpoints ──────────────────────────────────────────────────
+def get_user_from_session(session_id: str | None, response: Response) -> database.User:
+    """Get or create user from session cookie."""
+    user = database.get_or_create_user(session_id)
+    if not session_id or session_id != user.session_id:
+        # Set cookie for 30 days
+        response.set_cookie(
+            key="session_id",
+            value=user.session_id,
+            max_age=30 * 24 * 60 * 60,
+            httponly=True,
+            samesite="lax",
+        )
+    return user
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return (STATIC_DIR / "index.html").read_text()
 
 
 @app.get("/api/streams")
-async def list_streams() -> list[dict]:
-    return manager.list_streams()
+async def list_streams(
+    response: Response, session_id: str | None = Cookie(default=None)
+) -> list[dict]:
+    user = get_user_from_session(session_id, response)
+    return manager.list_streams(user.id)
 
 
 @app.post("/api/streams", status_code=201)
-async def add_stream(req: AddStreamRequest) -> dict:
-    info = await manager.add_stream_async(source_url=req.source_url, name=req.name)
-    managed = manager.get_stream(info.id)
+async def add_stream(
+    req: AddStreamRequest, response: Response, session_id: str | None = Cookie(default=None)
+) -> dict:
+    user = get_user_from_session(session_id, response)
+    info = await manager.add_stream_async(user_id=user.id, source_url=req.source_url, name=req.name)
+    managed = manager.get_stream(user.id, info.id)
     return {
         "id": info.id,
         "name": info.name,
@@ -82,7 +105,10 @@ async def add_stream(req: AddStreamRequest) -> dict:
 
 
 @app.delete("/api/streams/{stream_id}")
-async def remove_stream(stream_id: str):
-    if not manager.remove_stream(stream_id):
+async def remove_stream(
+    stream_id: str, response: Response, session_id: str | None = Cookie(default=None)
+):
+    user = get_user_from_session(session_id, response)
+    if not manager.remove_stream(user.id, stream_id):
         raise HTTPException(status_code=404, detail="Stream not found")
     return {"detail": "Stream removed"}

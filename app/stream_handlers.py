@@ -9,8 +9,6 @@ import logging
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +16,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class StreamMetadata:
     """Metadata extracted from a stream source."""
-    title: Optional[str] = None
-    duration: Optional[float] = None
+
+    title: str | None = None
+    duration: float | None = None
     is_live: bool = True
     is_vod: bool = False
 
@@ -66,6 +65,7 @@ class TwitchHandler(StreamHandler):
             )
             if result.returncode == 0:
                 import json
+
                 data = json.loads(result.stdout)
                 metadata = data.get("metadata", {})
                 return StreamMetadata(
@@ -75,7 +75,7 @@ class TwitchHandler(StreamHandler):
                 )
         except Exception as e:
             logger.warning("Failed to extract Twitch metadata: %s", e)
-        
+
         return StreamMetadata(is_live=True, is_vod=False)
 
     def get_feeder_command(self, url: str) -> list[str]:
@@ -96,8 +96,14 @@ class YouTubeHandler(StreamHandler):
         """Extract YouTube stream metadata."""
         try:
             result = subprocess.run(
-                ["yt-dlp", "--print", "%(title)s|%(is_live)s|%(duration)s",
-                 "--no-warnings", "--no-playlist", url],
+                [
+                    "yt-dlp",
+                    "--print",
+                    "%(title)s|%(is_live)s|%(duration)s",
+                    "--no-warnings",
+                    "--no-playlist",
+                    url,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -107,13 +113,15 @@ class YouTubeHandler(StreamHandler):
                 title = parts[0] if len(parts) > 0 else None
                 is_live_str = parts[1] if len(parts) > 1 else "False"
                 duration_str = parts[2] if len(parts) > 2 else "0"
-                
+
                 is_live = is_live_str.lower() in ("true", "1")
                 try:
-                    duration = float(duration_str) if duration_str and duration_str != "None" else None
+                    duration = (
+                        float(duration_str) if duration_str and duration_str != "None" else None
+                    )
                 except ValueError:
                     duration = None
-                
+
                 return StreamMetadata(
                     title=title,
                     duration=duration,
@@ -122,14 +130,19 @@ class YouTubeHandler(StreamHandler):
                 )
         except Exception as e:
             logger.warning("Failed to extract YouTube metadata: %s", e)
-        
+
         return StreamMetadata(is_live=False, is_vod=True)
 
     def get_feeder_command(self, url: str) -> list[str]:
         return [
-            "yt-dlp", "-f", "best",
-            "--throttled-rate", "100K",
-            "-o", "-", url,
+            "yt-dlp",
+            "-f",
+            "best",
+            "--throttled-rate",
+            "100K",
+            "-o",
+            "-",
+            url,
         ]
 
     def get_ffmpeg_input_args(self, url: str) -> tuple[list[str], str]:
@@ -159,7 +172,7 @@ class GenericHandler(StreamHandler):
             input_flags += ["-reconnect", "1", "-reconnect_delay_max", "5"]
             if ".m3u8" in url or "playlist" in url:
                 input_flags += ["-reconnect_streamed", "1"]
-        
+
         return (input_flags, url)
 
 

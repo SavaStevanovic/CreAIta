@@ -307,6 +307,7 @@ function renderStreams(streams) {
       card = document.createElement('div');
       card.className = 'card';
       card.dataset.id = s.id;
+      card.dataset.name = s.name;  // Store name for comparison
       card.innerHTML = `
         <video muted autoplay playsinline></video>
         <div class="card-body">
@@ -329,6 +330,13 @@ function renderStreams(streams) {
       // Update status dot
       const dot = card.querySelector('.status-dot');
       dot.className = `status-dot status-${s.status}`;
+
+      // Update stream name if it changed (e.g., metadata fetched)
+      if (card.dataset.name !== s.name) {
+        card.dataset.name = s.name;
+        const nameEl = card.querySelector('.name');
+        nameEl.innerHTML = `<span class="status-dot status-${s.status}"></span>${esc(s.name)}`;
+      }
 
       // If stream just became "running" and player not yet attached, attach it
       if (s.status === 'running' && !players[s.id]) {
@@ -383,10 +391,34 @@ async function refresh() {
 }
 
 // ─── Polling (keeps UI in sync, reconnects after refresh) ─────────
+let currentPollInterval = 4000;
 function startPolling(intervalMs = 4000) {
+  currentPollInterval = intervalMs;
   refresh();  // immediate first load
+  if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(refresh, intervalMs);
 }
+
+// Adaptive polling: faster when streams are initializing
+async function adaptiveRefresh() {
+  try {
+    const streams = await fetchStreams();
+    renderStreams(streams);
+
+    // If any stream is initializing, poll faster
+    const hasInitializing = streams.some(s => s.status === 'initializing');
+    const newInterval = hasInitializing ? 1000 : 4000;
+
+    if (newInterval !== currentPollInterval) {
+      startPolling(newInterval);
+    }
+  } catch (err) {
+    console.error('Refresh error:', err);
+  }
+}
+
+// Replace refresh with adaptive version
+refresh = adaptiveRefresh;
 
 startPolling();
 </script>
