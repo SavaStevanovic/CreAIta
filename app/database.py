@@ -217,3 +217,35 @@ def cleanup_old_sessions(days: int = 30) -> int:
     with get_db() as conn:
         cursor = conn.execute("DELETE FROM users WHERE created_at < ?", (cutoff,))
         return cursor.rowcount
+
+
+def get_all_streams() -> list[tuple[int, StreamRecord]]:
+    """Get all streams across all users. Returns list of (user_id, StreamRecord)."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, stream_id, name, source_url, status, error_message,
+                   is_platform_url, is_vod, created_at
+            FROM streams
+            ORDER BY created_at ASC
+        """
+        ).fetchall()
+
+    return [
+        (
+            row["user_id"],
+            StreamRecord(
+                id=row["id"],
+                user_id=row["user_id"],
+                stream_id=row["stream_id"],
+                name=row["name"],
+                source_url=row["source_url"],
+                status=row["status"],
+                error_message=row["error_message"],
+                is_platform_url=bool(row["is_platform_url"]),
+                is_vod=bool(row["is_vod"]),
+                created_at=row["created_at"],
+            ),
+        )
+        for row in rows
+    ]

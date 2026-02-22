@@ -282,6 +282,22 @@ function attachHls(videoEl, playlistUrl, streamId) {
 }
 
 // ─── Render ───────────────────────────────────────────────────────
+const STATUS_LABELS = {
+  running: 'Running',
+  starting: 'Starting…',
+  initializing: 'Initializing…',
+  downloading: 'Downloading video…',
+  restarting: 'Restarting…',
+  error: 'Error',
+  stopped: 'Stopped',
+};
+
+function statusTooltip(s) {
+  let tip = STATUS_LABELS[s.status] || s.status;
+  if (s.status === 'error' && s.error_message) tip += ': ' + s.error_message;
+  return tip;
+}
+
 function renderStreams(streams) {
   countEl.textContent = `${streams.length} stream${streams.length !== 1 ? 's' : ''}`;
   empty.style.display = streams.length === 0 ? '' : 'none';
@@ -312,7 +328,7 @@ function renderStreams(streams) {
         <video muted autoplay playsinline></video>
         <div class="card-body">
           <div class="info">
-            <div class="name"><span class="status-dot status-${s.status}"></span>${esc(s.name)}</div>
+            <div class="name"><span class="status-dot status-${s.status}" title="${esc(statusTooltip(s))}"></span>${esc(s.name)}</div>
             <div class="meta" title="${esc(s.source_url)}">${esc(s.source_url)}</div>
           </div>
           <button class="btn btn-danger btn-sm" onclick="handleRemove('${s.id}')">✕ Remove</button>
@@ -330,6 +346,7 @@ function renderStreams(streams) {
       // Update status dot
       const dot = card.querySelector('.status-dot');
       dot.className = `status-dot status-${s.status}`;
+      dot.title = statusTooltip(s);
 
       // Update stream name if it changed (e.g., metadata fetched)
       if (card.dataset.name !== s.name) {

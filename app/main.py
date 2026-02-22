@@ -28,6 +28,7 @@ async def lifespan(app: FastAPI):
     database.init_db()
     manager = StreamManager()
     logger.info("StreamManager initialised – database ready")
+    await manager.restore_streams()
     yield
     logger.info("Shutting down – stopping all streams")
     manager.stop_all()

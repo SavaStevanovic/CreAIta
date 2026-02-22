@@ -6,6 +6,7 @@ Uses dependency injection pattern for extensibility.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -94,48 +95,68 @@ class YouTubeHandler(StreamHandler):
 
     def get_metadata(self, url: str) -> StreamMetadata:
         """Extract YouTube stream metadata."""
-        try:
-            result = subprocess.run(
-                [
-                    "yt-dlp",
-                    "--print",
-                    "%(title)s|%(is_live)s|%(duration)s",
-                    "--no-warnings",
-                    "--no-playlist",
-                    url,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if result.returncode == 0:
-                parts = result.stdout.strip().split("|")
-                title = parts[0] if len(parts) > 0 else None
-                is_live_str = parts[1] if len(parts) > 1 else "False"
-                duration_str = parts[2] if len(parts) > 2 else "0"
+        # Try multiple strategies for metadata extraction (bot detection workaround)
+        strategies = [
+            [],
+            ["--cookies-from-browser", "chrome"],
+        ]
 
-                is_live = is_live_str.lower() in ("true", "1")
-                try:
-                    duration = (
-                        float(duration_str) if duration_str and duration_str != "None" else None
-                    )
-                except ValueError:
-                    duration = None
-
-                return StreamMetadata(
-                    title=title,
-                    duration=duration,
-                    is_live=is_live,
-                    is_vod=not is_live and duration is not None,
+        for extra_args in strategies:
+            try:
+                result = subprocess.run(
+                    [
+                        "yt-dlp",
+                        "--js-runtimes",
+                        "node",
+                        *extra_args,
+                        "--print",
+                        "%(title)s|%(is_live)s|%(duration)s",
+                        "--no-warnings",
+                        "--no-playlist",
+                        "--no-download",
+                        url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
                 )
-        except Exception as e:
-            logger.warning("Failed to extract YouTube metadata: %s", e)
+                if result.returncode == 0 and result.stdout.strip():
+                    parts = result.stdout.strip().split("|")
+                    title = parts[0] if len(parts) > 0 else None
+                    is_live_str = parts[1] if len(parts) > 1 else "False"
+                    duration_str = parts[2] if len(parts) > 2 else "0"
 
+                    is_live = is_live_str.lower() in ("true", "1")
+                    try:
+                        duration = (
+                            float(duration_str) if duration_str and duration_str != "None" else None
+                        )
+                    except ValueError:
+                        duration = None
+
+                    return StreamMetadata(
+                        title=title,
+                        duration=duration,
+                        is_live=is_live,
+                        is_vod=not is_live and duration is not None,
+                    )
+                # If bot detection, try next strategy
+                if "Sign in to confirm" in result.stderr:
+                    logger.info("YouTube bot detection during metadata, trying next strategy")
+                    continue
+                break  # Other error, don't retry
+            except Exception as e:
+                logger.warning("Failed to extract YouTube metadata: %s", e)
+                break
+
+        # Default: assume VOD (most YouTube links are VODs)
         return StreamMetadata(is_live=False, is_vod=True)
 
     def get_feeder_command(self, url: str) -> list[str]:
         return [
             "yt-dlp",
+            "--js-runtimes",
+            "node",
             "-f",
             "best",
             "--throttled-rate",
@@ -148,6 +169,114 @@ class YouTubeHandler(StreamHandler):
     def get_ffmpeg_input_args(self, url: str) -> tuple[list[str], str]:
         # YouTube uses pipe mode for both live and VOD piping
         return ([], "pipe:0")
+
+
+class AmssKamereHandler(StreamHandler):
+    """Handler for AMSS road cameras at kamere.amss.org.rs.
+
+    Stream URL format: https://kamere.amss.org.rs/{camera_id}/{camera_id}.m3u8
+    Requires a Cloudflare cf_clearance cookie from Chrome browser.
+    """
+
+    _CAMERA_NAMES: dict[str, str] = {
+        "horgos1": "Horgoš E-75 (Entry to Serbia from Hungary)",
+        "horgos2": "Horgoš E-75 (Exit from Serbia to Hungary)",
+        "batrovci1": "Batrovci E-70 (Entry to Serbia from Croatia)",
+        "batrovci2": "Batrovci E-70 (Exit from Serbia to Croatia)",
+        "gradina1": "Gradina E-80 (Entry to Serbia from Bulgaria)",
+        "gradina2": "Gradina E-80 (Exit from Serbia to Bulgaria)",
+        "presevo1": "Preševo E-75 (Entry to Serbia from N. Macedonia)",
+        "presevo2": "Preševo E-75 (Exit from Serbia to N. Macedonia)",
+    }
+    _UA = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+    )
+    _REFERER = "https://kamere.amss.org.rs/"
+
+    def can_handle(self, url: str) -> bool:
+        return "kamere.amss.org.rs" in url.lower()
+
+    def _extract_camera_id(self, url: str) -> str | None:
+        """Return the camera ID embedded in the URL (e.g. 'horgos1')."""
+        m = re.search(r"kamere\.amss\.org\.rs/([a-z0-9]+)", url.lower())
+        return m.group(1) if m else None
+
+    def _resolve_stream_url(self, url: str) -> str:
+        """Produce the HLS .m3u8 URL for a given camera page or direct URL."""
+        if url.endswith(".m3u8"):
+            return url
+        cam_id = self._extract_camera_id(url)
+        if cam_id:
+            return f"https://kamere.amss.org.rs/{cam_id}/{cam_id}.m3u8"
+        raise ValueError(
+            f"Cannot determine camera ID from URL '{url}'. "
+            "Use a URL like https://kamere.amss.org.rs/horgos1/horgos1.m3u8"
+        )
+
+    def _get_cf_clearance(self) -> str:
+        """Extract the Cloudflare cf_clearance cookie from Chrome."""
+
+        cookie_file = "/tmp/_amss_cf_cookies.txt"
+        try:
+            subprocess.run(
+                [
+                    "yt-dlp",
+                    "--cookies-from-browser",
+                    "chrome",
+                    "--cookies",
+                    cookie_file,
+                    "--skip-download",
+                    "--no-warnings",
+                    "--quiet",
+                    "https://kamere.amss.org.rs/",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except Exception as e:
+            logger.warning("Failed to export AMSS cookies: %s", e)
+            return ""
+        try:
+            with open(cookie_file) as fh:
+                m = re.search(r"cf_clearance\s+(\S+)", fh.read())
+                return m.group(1) if m else ""
+        except OSError:
+            return ""
+
+    def get_metadata(self, url: str) -> StreamMetadata:
+        cam_id = self._extract_camera_id(url)
+        if cam_id:
+            name = self._CAMERA_NAMES.get(cam_id, f"AMSS Camera {cam_id}")
+        else:
+            name = "AMSS Road Camera"
+        return StreamMetadata(title=name, is_live=True, is_vod=False)
+
+    def get_feeder_command(self, url: str) -> list[str]:
+        # AMSS uses direct FFmpeg mode (no separate feeder process)
+        return []
+
+    def get_ffmpeg_input_args(self, url: str) -> tuple[list[str], str]:
+        stream_url = self._resolve_stream_url(url)
+        cf_clearance = self._get_cf_clearance()
+
+        cookie_str = f"cf_clearance={cf_clearance}" if cf_clearance else ""
+        headers = f"User-Agent: {self._UA}\r\n" f"Referer: {self._REFERER}\r\n"
+        if cookie_str:
+            headers += f"Cookie: {cookie_str}\r\n"
+
+        input_flags = [
+            "-headers",
+            headers,
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+        ]
+        return (input_flags, stream_url)
 
 
 class GenericHandler(StreamHandler):
@@ -183,6 +312,7 @@ class StreamHandlerRegistry:
         self._handlers: list[StreamHandler] = [
             TwitchHandler(),
             YouTubeHandler(),
+            AmssKamereHandler(),
             GenericHandler(),  # Must be last (fallback)
         ]
 

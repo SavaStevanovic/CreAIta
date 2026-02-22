@@ -49,17 +49,33 @@ def _detect_youtube_vod(url: str) -> bool:
     if not _YOUTUBE_RE.search(url):
         return False
     try:
-        result = subprocess.run(
-            ["yt-dlp", "--print", "is_live", "--no-download", "--no-warnings", url],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        val = result.stdout.strip().lower()
-        # is_live: "True" for live, "False"/"None"/"" for VOD
-        return val not in ("true",)
+        # Try without cookies first
+        for extra_args in [[], ["--cookies-from-browser", "chrome"]]:
+            result = subprocess.run(
+                [
+                    "yt-dlp",
+                    "--js-runtimes",
+                    "node",
+                    *extra_args,
+                    "--print",
+                    "is_live",
+                    "--no-download",
+                    "--no-warnings",
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode == 0:
+                val = result.stdout.strip().lower()
+                return val not in ("true",)
+            if "Sign in to confirm" not in result.stderr:
+                break  # Not a bot-detection issue
     except Exception:
-        return False
+        pass
+    # Default to True (most YouTube URLs are VODs)
+    return True
 
 
 def resolve_stream_url(url: str) -> str:
@@ -75,28 +91,45 @@ def resolve_stream_url(url: str) -> str:
 
     # ---------- YouTube → yt-dlp ----------
     if _YOUTUBE_RE.search(url):
-        try:
-            result = subprocess.run(
-                ["yt-dlp", "-f", "best", "--print", "urls", url],
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-            if result.returncode == 0:
-                resolved = result.stdout.strip().split("\n")[0]
-                if resolved.startswith("http"):
-                    logger.info("Resolved (yt-dlp) %s → %s", url, resolved[:120])
-                    return resolved
-            logger.warning(
-                "yt-dlp failed (rc=%d) for %s: %s",
-                result.returncode,
-                url,
-                result.stderr.strip()[:200],
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning("yt-dlp timed out for %s", url)
-        except FileNotFoundError:
-            logger.warning("yt-dlp not installed, trying streamlink for %s", url)
+        for extra_args in [[], ["--cookies-from-browser", "chrome"]]:
+            try:
+                result = subprocess.run(
+                    [
+                        "yt-dlp",
+                        "--js-runtimes",
+                        "node",
+                        *extra_args,
+                        "-f",
+                        "best",
+                        "--print",
+                        "urls",
+                        url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                if result.returncode == 0:
+                    resolved = result.stdout.strip().split("\n")[0]
+                    if resolved.startswith("http"):
+                        logger.info("Resolved (yt-dlp) %s → %s", url, resolved[:120])
+                        return resolved
+                if "Sign in to confirm" in result.stderr:
+                    logger.info("Bot detection resolving URL, trying with cookies")
+                    continue
+                logger.warning(
+                    "yt-dlp failed (rc=%d) for %s: %s",
+                    result.returncode,
+                    url,
+                    result.stderr.strip()[:200],
+                )
+                break
+            except subprocess.TimeoutExpired:
+                logger.warning("yt-dlp timed out for %s", url)
+                break
+            except FileNotFoundError:
+                logger.warning("yt-dlp not installed, trying streamlink for %s", url)
+                break
 
     # ---------- Twitch / fallback → streamlink ----------
     try:
@@ -210,7 +243,14 @@ class ManagedStream:
             if self.info.is_vod:
                 self._start_vod(gen)
             elif self.info.is_platform_url:
-                self._start_piped(gen)
+                # Use piped mode only when the handler provides a feeder command
+                feeder_cmd = (
+                    self._handler.get_feeder_command(self.info.source_url) if self._handler else []
+                )
+                if feeder_cmd:
+                    self._start_piped(gen)
+                else:
+                    self._start_direct(gen)
             else:
                 self._start_direct(gen)
         except Exception as exc:
@@ -326,22 +366,61 @@ class ManagedStream:
         else:
             self.info.status = "downloading"
             logger.info("Downloading video for stream %s (gen %d)…", self.info.id, gen)
-            result = subprocess.run(
-                [
+
+            # Try multiple strategies for YouTube downloads
+            strategies = [
+                (["--js-runtimes", "node", "--no-warnings", "-f", "best"], "without cookies"),
+                (
+                    [
+                        "--js-runtimes",
+                        "node",
+                        "--cookies-from-browser",
+                        "chrome",
+                        "--no-warnings",
+                        "-f",
+                        "best",
+                    ],
+                    "with Chrome cookies",
+                ),
+            ]
+
+            result = None
+            error_messages = []
+
+            for extra_args, description in strategies:
+                logger.info("Attempting download %s for stream %s", description, self.info.id)
+                cmd = [
                     "yt-dlp",
-                    "-f",
-                    "best",
-                    "--no-warnings",
+                    *extra_args,
                     "-o",
                     str(self.hls_dir / "source_video.%(ext)s"),
                     url,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"yt-dlp download failed: {result.stderr.strip()[:300]}")
+                ]
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+
+                if result.returncode == 0:
+                    logger.info("Download successful %s", description)
+                    break
+                else:
+                    error_msg = result.stderr.strip()[:200]
+                    error_messages.append(f"{description}: {error_msg}")
+                    logger.warning("Download failed %s: %s", description, error_msg)
+                    # Only retry with cookies if it's a bot detection issue
+                    if "Sign in to confirm" not in result.stderr:
+                        break
+
+            if result and result.returncode != 0:
+                combined_error = " | ".join(error_messages)
+                raise RuntimeError(
+                    f"yt-dlp download failed after trying all strategies. "
+                    f"Please ensure you're logged in to YouTube in your browser. Errors: {combined_error[:400]}"
+                )
+
             existing = [
                 f
                 for f in self.hls_dir.glob("source_video.*")
@@ -713,6 +792,46 @@ class StreamManager:
         self._lock = threading.Lock()
         self._handler_registry = StreamHandlerRegistry()
 
+    async def restore_streams(self) -> None:
+        """Restore streams from database and restart them."""
+        all_records = database.get_all_streams()
+        if not all_records:
+            logger.info("No streams to restore from database")
+            return
+
+        logger.info("Restoring %d stream(s) from database", len(all_records))
+
+        for user_id, rec in all_records:
+            try:
+                info = StreamInfo(
+                    id=rec.stream_id,
+                    name=rec.name,
+                    source_url=rec.source_url,
+                    created_at=rec.created_at,
+                    status="initializing",
+                    is_platform_url=rec.is_platform_url,
+                    is_vod=rec.is_vod,
+                )
+                managed = ManagedStream(info)
+                with self._lock:
+                    self._streams[(user_id, rec.stream_id)] = managed
+
+                # Launch background initialization (same path as add_stream_async)
+                asyncio.create_task(self._initialize_stream_background(user_id, managed, rec.name))
+                logger.info(
+                    "Queued restore for stream %s (%s) for user %d",
+                    rec.stream_id,
+                    rec.name,
+                    user_id,
+                )
+            except Exception as e:
+                logger.exception(
+                    "Failed to restore stream %s for user %d: %s",
+                    rec.stream_id,
+                    user_id,
+                    e,
+                )
+
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
@@ -795,6 +914,7 @@ class StreamManager:
             managed.info.is_platform_url = handler.__class__.__name__ in (
                 "TwitchHandler",
                 "YouTubeHandler",
+                "AmssKamereHandler",
             )
 
             if metadata:
